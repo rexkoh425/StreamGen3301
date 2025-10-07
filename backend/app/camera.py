@@ -9,11 +9,14 @@ serve them without blocking.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
+
+LOGGER = logging.getLogger(__name__)
 
 try:
     from picamera2 import Picamera2  # type: ignore
@@ -74,11 +77,25 @@ class CameraStream:
         self._picam: Optional[Picamera2] = None
         self._capture = None
         self._backend_name = "picamera2" if self._use_picamera else "opencv"
+        self._debug_format_counts: Dict[str, int] = {}
+        self._debug_format_limit = 3
+
+        LOGGER.debug(
+            "CameraStream initialized with backend=%s size=(%d, %d) target_fps=%s",
+            self._backend_name,
+            self._width,
+            self._height,
+            self._target_fps,
+        )
 
     # Public API -----------------------------------------------------------------
     def register_hook(self, hook: FrameHook) -> None:
         """Register a callable that will receive frames and timestamps."""
         self._hooks.append(hook)
+        LOGGER.debug(
+            "Registered frame hook %s; frames delivered as BGR numpy arrays",
+            getattr(hook, "__name__", repr(hook)),
+        )
 
     def start(self) -> None:
         """Start the capture thread if not already running."""
@@ -86,6 +103,9 @@ class CameraStream:
             return
 
         self._run_event.set()
+        LOGGER.debug(
+            "Starting camera capture thread using backend=%s", self._backend_name
+        )
         if self._use_picamera:
             self._start_picamera()
         else:
@@ -157,6 +177,11 @@ class CameraStream:
                 # Some sensor modes may not support the requested FPS; ignore.
                 pass
         self._picam.start()
+        LOGGER.debug(
+            "Started PiCamera2 backend; raw frames arrive as RGB arrays (%d x %d x 3)",
+            self._height,
+            self._width,
+        )
 
     def _start_opencv(self) -> None:
         assert cv2 is not None  # for type checkers
@@ -170,6 +195,9 @@ class CameraStream:
             self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._height))
         if self._target_fps:
             self._capture.set(cv2.CAP_PROP_FPS, float(self._target_fps))
+        LOGGER.debug(
+            "Started OpenCV VideoCapture backend; frames expected as BGR arrays"
+        )
 
     def _capture_loop(self) -> None:
         interval = 1.0 / self._target_fps if self._target_fps else 0.0
@@ -179,12 +207,18 @@ class CameraStream:
                 time.sleep(0.1)
                 continue
 
+            self._log_frame_debug("pre_hooks", frame, "BGR (pre-hook capture loop)")
             frame_to_store = frame
             for hook in self._hooks:
                 try:
                     result = hook(frame_to_store.copy(), timestamp)
                     if isinstance(result, np.ndarray):
                         frame_to_store = result
+                        self._log_frame_debug(
+                            f"hook:{getattr(hook, '__name__', str(hook))}",
+                            frame_to_store,
+                            "BGR (hook-modified frame)",
+                        )
                 except Exception:  # pragma: no cover - defensive
                     # Hook exceptions should not kill the capture loop.
                     continue
@@ -192,6 +226,7 @@ class CameraStream:
             with self._frame_lock:
                 self._latest_frame = frame_to_store
                 self._latest_timestamp = timestamp
+            self._log_frame_debug("post_hooks", frame_to_store, "BGR (stored frame)")
 
             if interval:
                 elapsed = time.time() - timestamp
@@ -203,18 +238,23 @@ class CameraStream:
         timestamp = time.time()
         if self._use_picamera and self._picam:
             frame = self._picam.capture_array()
+            self._log_frame_debug("picam_raw", frame, "RGB (PiCamera2 output)")
             # PiCamera2 returns RGB frames by default; normalize to BGR for OpenCV.
             if frame.ndim == 3 and frame.shape[2] == 3:
                 if _CV2_AVAILABLE and cv2 is not None:
                     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 else:
                     frame = frame[:, :, ::-1]
+                self._log_frame_debug(
+                    "picam_converted", frame, "BGR (converted from PiCamera2 RGB)"
+                )
             return frame, timestamp
         if self._capture is None:
             return None, timestamp
         ok, frame = self._capture.read()
         if not ok:
             return None, timestamp
+        self._log_frame_debug("opencv_raw", frame, "BGR (OpenCV VideoCapture output)")
         return frame, timestamp
 
     def __del__(self) -> None:
@@ -223,3 +263,70 @@ class CameraStream:
         except Exception:
             # Suppress exceptions in GC context; resources are already gone.
             pass
+
+    # Debug helpers -----------------------------------------------------------
+    def _log_frame_debug(
+        self, stage: str, frame: Optional[np.ndarray], assumed_mode: str
+    ) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+
+        count = self._debug_format_counts.get(stage, 0)
+        if count >= self._debug_format_limit:
+            return
+        self._debug_format_counts[stage] = count + 1
+
+        if frame is None:
+            LOGGER.debug(
+                "Frame[%s #%d]: None (expected %s)",
+                stage,
+                count + 1,
+                assumed_mode,
+            )
+            return
+
+        if frame.size == 0:
+            LOGGER.debug(
+                "Frame[%s #%d]: empty array shape=%s dtype=%s assumed_order=%s",
+                stage,
+                count + 1,
+                frame.shape,
+                frame.dtype,
+                assumed_mode,
+            )
+            return
+
+        shape = frame.shape
+        dtype = frame.dtype
+        channels = 1
+        sample_value: object = None
+        try:
+            if frame.ndim == 2:
+                channels = 1
+                sample_value = int(frame[0, 0])
+            elif frame.ndim >= 3:
+                channels = shape[2]
+                sample = frame[0, 0]
+                if isinstance(sample, np.ndarray):
+                    subset = sample.flatten()[: min(3, channels)]
+                    sample_value = [int(x) for x in subset]
+                else:
+                    sample_value = int(sample)
+            elif frame.ndim == 1:
+                channels = 1
+                sample_value = int(frame[0])
+            else:
+                channels = shape[-1] if shape else 0
+        except Exception:
+            sample_value = "unavailable"
+
+        LOGGER.debug(
+            "Frame[%s #%d]: shape=%s dtype=%s channels=%d sample=%s assumed_order=%s",
+            stage,
+            count + 1,
+            shape,
+            dtype,
+            channels,
+            sample_value,
+            assumed_mode,
+        )
