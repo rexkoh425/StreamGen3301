@@ -1,0 +1,4 @@
+# Ignore all environment files
+.env
+backend/.env
+chatbot/.env

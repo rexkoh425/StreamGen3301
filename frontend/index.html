@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pi Camera Stream</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="card">
+        <h1>Pi Camera Stream</h1>
+        <label class="field">
+          <span>Backend URL</span>
+          <input id="backend-url" type="text" placeholder="http://localhost:8000" />
+        </label>
+        <div class="controls">
+          <button id="connect">Connect</button>
+          <button id="start" class="primary">Start Camera</button>
+          <button id="stop">Stop Camera</button>
+          <button id="refresh-status">Refresh Status</button>
+        </div>
+        <p id="status">Status: unknown</p>
+      </section>
+
+      <section class="card">
+        <header>
+          <h2>Live Stream</h2>
+          <button id="toggle-stream" class="secondary">Hide Stream</button>
+        </header>
+        <div class="stream-container">
+          <img id="stream" alt="Live stream" />
+        </div>
+      </section>
+
+      <section class="card">
+        <header>
+          <h2>Single Frame Capture</h2>
+        </header>
+        <div class="frame-controls">
+          <button id="capture-frame">Capture Frame</button>
+        </div>
+        <div class="frame-container">
+          <img id="frame-preview" alt="Most recent frame" />
+        </div>
+      </section>
+    </main>
+
+    <template id="status-template">
+      Status: <span class="status-value"></span>
+      <small class="backend-hint"></small>
+    </template>
+
+    <script src="./script.js" type="module"></script>
+  </body>
+</html>
