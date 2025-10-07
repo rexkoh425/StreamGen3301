@@ -203,6 +203,12 @@ class CameraStream:
         timestamp = time.time()
         if self._use_picamera and self._picam:
             frame = self._picam.capture_array()
+            # PiCamera2 returns RGB frames by default; normalize to BGR for OpenCV.
+            if frame.ndim == 3 and frame.shape[2] == 3:
+                if _CV2_AVAILABLE and cv2 is not None:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                else:
+                    frame = frame[:, :, ::-1]
             return frame, timestamp
         if self._capture is None:
             return None, timestamp

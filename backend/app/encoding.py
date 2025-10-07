@@ -39,7 +39,8 @@ def encode_frame_to_jpeg(frame: np.ndarray, quality: int = 85) -> Optional[bytes
 
     if _PIL_AVAILABLE:
         rgb_frame = _to_rgb_for_pil(frame, mode)
-        image = Image.fromarray(rgb_frame, mode=mode)
+        pil_mode = "L" if mode == "L" else "RGB"
+        image = Image.fromarray(rgb_frame, mode=pil_mode)
         with io.BytesIO() as output:
             image.save(output, format="JPEG", quality=quality)
             return output.getvalue()
@@ -49,35 +50,25 @@ def encode_frame_to_jpeg(frame: np.ndarray, quality: int = 85) -> Optional[bytes
 
 def _normalize_frame_channels(frame: np.ndarray) -> Tuple[np.ndarray, str]:
     """
-    Convert incoming frame into a JPEG-friendly layout.
-
-    Returns a tuple of (frame, mode) where frame is in BGR or grayscale order
-    suitable for OpenCV, and ``mode`` is the corresponding PIL mode.
+    Normalize to OpenCV-friendly layout. We treat 3-ch as BGR (OpenCV default).
+    Returns (frame_in_BGR_or_gray, mode_for_PIL_bridge)
     """
-
     if frame.ndim == 2:
         return frame, "L"
-
     if frame.ndim != 3:
         raise ValueError("Unsupported frame shape for JPEG encoding.")
-
     channels = frame.shape[2]
-
     if channels == 3:
-        return frame, "RGB"
-
+        return frame, "BGR"
     if channels == 4:
-        # PiCamera2 defaults to XBGR8888; drop the filler channel.
-        bgr = frame[:, :, 1:]
-        return bgr, "RGB"
-
+        # Drop alpha/filler channel, keep first three components as BGR for OpenCV.
+        return frame[:, :, :3], "BGR"
     raise ValueError(f"Unsupported channel count for JPEG encoding: {channels}")
 
 
 def _to_rgb_for_pil(frame: np.ndarray, mode: str) -> np.ndarray:
     if mode == "L":
         return frame
-    if mode == "RGB":
-        # OpenCV uses BGR ordering for color frames.
+    if mode == "BGR":
         return frame[:, :, ::-1]
     raise ValueError(f"Unsupported PIL mode: {mode}")
