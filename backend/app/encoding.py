@@ -84,7 +84,6 @@ def _log_frame_debug(
 
 try:
     import cv2
-
     _CV2_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional dependency
     cv2 = None  # type: ignore
@@ -92,7 +91,6 @@ except ImportError:  # pragma: no cover - optional dependency
 
 try:
     from PIL import Image
-
     _PIL_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional dependency
     Image = None  # type: ignore

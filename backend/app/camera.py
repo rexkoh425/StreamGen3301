@@ -1,332 +1,180 @@
 """
-Camera stream management for Raspberry Pi devices.
-
-This module provides a small abstraction that hides whether frames
-come from a PiCamera2 pipeline or a generic OpenCV ``VideoCapture``.
-It captures frames on a background thread so the FastAPI layer can
-serve them without blocking.
+USB camera stream using OpenCV (V4L2) with MJPEG preferred.
+Threaded grabber with hook support and auto-reopen on failure.
 """
 
 from __future__ import annotations
-
-import logging
-import threading
-import time
-from typing import Callable, Dict, List, Optional
-
+import logging, threading, time
+from typing import Callable, List, Optional, Tuple, Dict
 import numpy as np
+import cv2
 
 LOGGER = logging.getLogger(__name__)
-
-try:
-    from picamera2 import Picamera2  # type: ignore
-
-    _PICAMERA_AVAILABLE = True
-except ImportError:  # pragma: no cover - handled dynamically at runtime
-    Picamera2 = None  # type: ignore
-    _PICAMERA_AVAILABLE = False
-
-try:
-    import cv2
-
-    _CV2_AVAILABLE = True
-except ImportError:  # pragma: no cover - handled dynamically at runtime
-    cv2 = None  # type: ignore
-    _CV2_AVAILABLE = False
-
-
-FrameHook = Callable[[np.ndarray, float], None]
-
+FrameHook = Callable[[np.ndarray, float], Optional[np.ndarray]]
 
 class CameraStream:
-    """Continuously grabs frames from the configured camera source."""
-
     def __init__(
         self,
-        use_picamera: bool = True,
-        device_index: int = 0,
-        width: Optional[int] = None,
-        height: Optional[int] = None,
-        target_fps: Optional[float] = 20.0,
+        device_index: int = 1,
+        width: int = 1280,
+        height: int = 720,
+        target_fps: float = 30.0,
+        prefer_mjpeg: bool = True,
+        reopen_on_fail: bool = True,
+        autofocus: Optional[int] = None,   # 0=off, 1=on, None=leave default
+        exposure: Optional[float] = None,  # driver-specific scale; None=leave default
     ) -> None:
-        if use_picamera and not _PICAMERA_AVAILABLE:
-            raise RuntimeError(
-                "PiCamera2 was requested but the library is not installed. "
-                "Install it or pass use_picamera=False to fallback to OpenCV."
-            )
-        if not use_picamera and not _CV2_AVAILABLE:
-            raise RuntimeError(
-                "OpenCV fallback requested but cv2 is not available. "
-                "Install opencv-python or enable PiCamera2."
-            )
+        self._idx = int(device_index)
+        self._w, self._h = int(width), int(height)
+        self._fps = float(target_fps)
+        self._prefer_mjpeg = bool(prefer_mjpeg)
+        self._reopen = bool(reopen_on_fail)
+        self._autofocus = autofocus
+        self._exposure = exposure
 
-        self._use_picamera = use_picamera and _PICAMERA_AVAILABLE
-        self._device_index = device_index
-        self._width = width or 1536
-        self._height = height or 864
-        self._target_fps = target_fps or 20.0
-
-        self._frame_lock = threading.Lock()
-        self._latest_frame: Optional[np.ndarray] = None
-        self._latest_timestamp: float = 0.0
+        self._cap: Optional[cv2.VideoCapture] = None
+        self._run = threading.Event()
+        self._thr: Optional[threading.Thread] = None
         self._hooks: List[FrameHook] = []
 
-        self._run_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._lk = threading.Lock()
+        self._frame: Optional[np.ndarray] = None
+        self._ts: float = 0.0
 
-        self._picam: Optional[Picamera2] = None
-        self._capture = None
-        self._backend_name = "picamera2" if self._use_picamera else "opencv"
-        self._debug_format_counts: Dict[str, int] = {}
-        self._debug_format_limit = 3
+        self._dbg_counts: Dict[str, int] = {}
+        self._dbg_limit = 3
 
-        LOGGER.debug(
-            "CameraStream initialized with backend=%s size=(%d, %d) target_fps=%s",
-            self._backend_name,
-            self._width,
-            self._height,
-            self._target_fps,
-        )
-
-    # Public API -----------------------------------------------------------------
+    # -------- Public API --------
     def register_hook(self, hook: FrameHook) -> None:
-        """Register a callable that will receive frames and timestamps."""
         self._hooks.append(hook)
-        LOGGER.debug(
-            "Registered frame hook %s; frames delivered as BGR numpy arrays",
-            getattr(hook, "__name__", repr(hook)),
-        )
 
     def start(self) -> None:
-        """Start the capture thread if not already running."""
-        if self._run_event.is_set():
+        if self._run.is_set():
             return
-
-        self._run_event.set()
-        LOGGER.debug(
-            "Starting camera capture thread using backend=%s", self._backend_name
-        )
-        if self._use_picamera:
-            self._start_picamera()
-        else:
-            self._start_opencv()
-
-        self._thread = threading.Thread(
-            target=self._capture_loop, name="CameraCaptureThread", daemon=True
-        )
-        self._thread.start()
+        self._run.set()
+        self._open()
+        self._thr = threading.Thread(target=self._loop, name="CameraCaptureThread", daemon=True)
+        self._thr.start()
 
     def stop(self) -> None:
-        """Stop capturing frames."""
-        run_event = getattr(self, "_run_event", None)
-        if run_event is None or not run_event.is_set():
+        if not self._run.is_set():
             return
+        self._run.clear()
+        if self._thr and self._thr.is_alive():
+            self._thr.join(timeout=2.0)
+        self._thr = None
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+        self._cap = None
 
-        run_event.clear()
-        thread = getattr(self, "_thread", None)
-        if thread and thread.is_alive():
-            thread.join(timeout=2.0)
-        self._thread = None
-
-        use_picamera = getattr(self, "_use_picamera", False)
-        if use_picamera:
-            picam = getattr(self, "_picam", None)
-            if picam:
-                picam.stop()
-                picam.close()
-            self._picam = None
-        else:
-            capture = getattr(self, "_capture", None)
-            if capture:
-                capture.release()
-            self._capture = None
+    def read_latest(self) -> Tuple[Optional[np.ndarray], float]:
+        with self._lk:
+            if self._frame is None:
+                return None, 0.0
+            return self._frame.copy(), self._ts
 
     def read(self) -> Optional[np.ndarray]:
-        """Return the most recently captured frame, or None if unavailable."""
-        with self._frame_lock:
-            if self._latest_frame is None:
-                return None
-            return self._latest_frame.copy()
+        frame, _ = self.read_latest()
+        return frame
 
     def is_running(self) -> bool:
-        run_event = getattr(self, "_run_event", None)
-        return bool(run_event and run_event.is_set())
+        return self._run.is_set()
 
     def backend_name(self) -> str:
-        return getattr(self, "_backend_name", "unknown")
+        return "opencv-v4l2"
 
-    # Internals ------------------------------------------------------------------
-    def _start_picamera(self) -> None:
-        assert Picamera2 is not None  # for type checkers
-        self._picam = Picamera2()
+    # -------- Internals --------
+    def _open(self) -> None:
+        self._cap = cv2.VideoCapture(self._idx, cv2.CAP_V4L2)
+        if not self._cap.isOpened():
+            self._cap.open(self._idx)
+        if not self._cap.isOpened():
+            raise RuntimeError(f"Cannot open /dev/video{self._idx}")
 
-        video_config = self._picam.create_video_configuration(
-            main={
-                "size": (
-                    self._width,
-                    self._height,
-                )
-            },
-            buffer_count=4,
-        )
-        self._picam.configure(video_config)
-        if self._target_fps:
+        # Prefer MJPEG for USB bandwidth; fallback to YUYV if MJPG unsupported
+        if self._prefer_mjpeg:
+            self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+        # Resolution / FPS
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._w))
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._h))
+        self._cap.set(cv2.CAP_PROP_FPS, float(self._fps))
+
+        # Try to disable driver-side buffering so we always grab the freshest frame
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
             try:
-                self._picam.set_controls({"FrameRate": float(self._target_fps)})
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except Exception:
-                # Some sensor modes may not support the requested FPS; ignore.
-                pass
-        self._picam.start()
-        LOGGER.debug(
-            "Started PiCamera2 backend; raw frames arrive as RGB arrays (%d x %d x 3)",
-            self._height,
-            self._width,
-        )
+                LOGGER.debug(
+                    "Unable to set capture buffer size; continuing.", exc_info=True
+                )
 
-    def _start_opencv(self) -> None:
-        assert cv2 is not None  # for type checkers
-        self._capture = cv2.VideoCapture(self._device_index, cv2.CAP_V4L2)
-        if not self._capture.isOpened():
-            self._capture.open(self._device_index)
+        # Optional controls (best-effort; drivers differ)
+        if self._autofocus is not None:
+            try:
+                self._cap.set(cv2.CAP_PROP_AUTOFOCUS, int(self._autofocus))
+            except Exception:
+                LOGGER.debug("Unable to set autofocus, continuing.", exc_info=True)
+        if self._exposure is not None:
+            try:
+                self._cap.set(cv2.CAP_PROP_EXPOSURE, float(self._exposure))
+            except Exception:
+                LOGGER.debug("Unable to set exposure, continuing.", exc_info=True)
 
-        if self._width:
-            self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._width))
-        if self._height:
-            self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._height))
-        if self._target_fps:
-            self._capture.set(cv2.CAP_PROP_FPS, float(self._target_fps))
-        LOGGER.debug(
-            "Started OpenCV VideoCapture backend; frames expected as BGR arrays"
-        )
+    def _reopen_if_needed(self) -> None:
+        if not self._reopen:
+            return
+        try:
+            if self._cap is None or not self._cap.isOpened():
+                self.stop()
+                self._open()
+        except Exception as e:
+            LOGGER.exception("Reopen failed: %s", e)
 
-    def _capture_loop(self) -> None:
-        interval = 1.0 / self._target_fps if self._target_fps else 0.0
-        while self._run_event.is_set():
-            frame, timestamp = self._grab_frame()
-            if frame is None:
-                time.sleep(0.1)
+    def _loop(self) -> None:
+        interval = 1.0 / self._fps if self._fps > 0 else 0.0
+        misses = 0
+        while self._run.is_set():
+            ts = time.time()
+            ok, frame = (False, None) if self._cap is None else self._cap.read()
+            if not ok or frame is None:
+                misses += 1
+                if self._reopen and misses >= 30:
+                    self._reopen_if_needed()
+                    misses = 0
+                time.sleep(0.05)
                 continue
+            misses = 0
 
-            self._log_frame_debug("pre_hooks", frame, "BGR (pre-hook capture loop)")
-            frame_to_store = frame
+            # Hook pipeline
+            out = frame
             for hook in self._hooks:
                 try:
-                    result = hook(frame_to_store.copy(), timestamp)
-                    if isinstance(result, np.ndarray):
-                        frame_to_store = result
-                        self._log_frame_debug(
-                            f"hook:{getattr(hook, '__name__', str(hook))}",
-                            frame_to_store,
-                            "BGR (hook-modified frame)",
-                        )
-                except Exception:  # pragma: no cover - defensive
-                    # Hook exceptions should not kill the capture loop.
+                    res = hook(out.copy(), ts)
+                    if isinstance(res, np.ndarray):
+                        out = res
+                except Exception:
+                    LOGGER.exception("Hook error; continuing.")
                     continue
 
-            with self._frame_lock:
-                self._latest_frame = frame_to_store
-                self._latest_timestamp = timestamp
-            self._log_frame_debug("post_hooks", frame_to_store, "BGR (stored frame)")
+            # 💡 Only keep the newest frame (overwrite immediately)
+            with self._lk:
+                self._frame = out
+                self._ts = ts
 
+            # Sleep only if needed; otherwise, we always read next frame
             if interval:
-                elapsed = time.time() - timestamp
-                delay = interval - elapsed
+                dt = time.time() - ts
+                delay = max(0.0, interval - dt)
                 if delay > 0:
                     time.sleep(delay)
 
-    def _grab_frame(self) -> tuple[Optional[np.ndarray], float]:
-        timestamp = time.time()
-        if self._use_picamera and self._picam:
-            frame = self._picam.capture_array()
-            self._log_frame_debug("picam_raw", frame, "RGB (PiCamera2 output)")
-            # PiCamera2 returns RGB frames by default; normalize to BGR for OpenCV.
-            if frame.ndim == 3 and frame.shape[2] == 3:
-                if _CV2_AVAILABLE and cv2 is not None:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                else:
-                    frame = frame[:, :, ::-1]
-                self._log_frame_debug(
-                    "picam_converted", frame, "BGR (converted from PiCamera2 RGB)"
-                )
-            return frame, timestamp
-        if self._capture is None:
-            return None, timestamp
-        ok, frame = self._capture.read()
-        if not ok:
-            return None, timestamp
-        self._log_frame_debug("opencv_raw", frame, "BGR (OpenCV VideoCapture output)")
-        return frame, timestamp
 
     def __del__(self) -> None:
         try:
             self.stop()
         except Exception:
-            # Suppress exceptions in GC context; resources are already gone.
             pass
-
-    # Debug helpers -----------------------------------------------------------
-    def _log_frame_debug(
-        self, stage: str, frame: Optional[np.ndarray], assumed_mode: str
-    ) -> None:
-        if not LOGGER.isEnabledFor(logging.DEBUG):
-            return
-
-        count = self._debug_format_counts.get(stage, 0)
-        if count >= self._debug_format_limit:
-            return
-        self._debug_format_counts[stage] = count + 1
-
-        if frame is None:
-            LOGGER.debug(
-                "Frame[%s #%d]: None (expected %s)",
-                stage,
-                count + 1,
-                assumed_mode,
-            )
-            return
-
-        if frame.size == 0:
-            LOGGER.debug(
-                "Frame[%s #%d]: empty array shape=%s dtype=%s assumed_order=%s",
-                stage,
-                count + 1,
-                frame.shape,
-                frame.dtype,
-                assumed_mode,
-            )
-            return
-
-        shape = frame.shape
-        dtype = frame.dtype
-        channels = 1
-        sample_value: object = None
-        try:
-            if frame.ndim == 2:
-                channels = 1
-                sample_value = int(frame[0, 0])
-            elif frame.ndim >= 3:
-                channels = shape[2]
-                sample = frame[0, 0]
-                if isinstance(sample, np.ndarray):
-                    subset = sample.flatten()[: min(3, channels)]
-                    sample_value = [int(x) for x in subset]
-                else:
-                    sample_value = int(sample)
-            elif frame.ndim == 1:
-                channels = 1
-                sample_value = int(frame[0])
-            else:
-                channels = shape[-1] if shape else 0
-        except Exception:
-            sample_value = "unavailable"
-
-        LOGGER.debug(
-            "Frame[%s #%d]: shape=%s dtype=%s channels=%d sample=%s assumed_order=%s",
-            stage,
-            count + 1,
-            shape,
-            dtype,
-            channels,
-            sample_value,
-            assumed_mode,
-        )
