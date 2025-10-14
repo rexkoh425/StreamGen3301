@@ -1,0 +1,9 @@
+.venv
+backend/.venv
+__pycache__
+*.pyc
+.git
+recordings
+recording.mp4
+node_modules
+frontend/node_modules

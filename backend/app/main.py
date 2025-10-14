@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import os
 import asyncio
-from typing import AsyncIterator
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import AsyncIterator, Optional
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from .camera import CameraStream
 from .encoding import encode_frame_to_jpeg
-from .hooks import annotate_frame, rotate_frame, sharpen_frame
+from .hooks import annotate_frame, sharpen_frame
 
 app = FastAPI(title="USB Camera Stream API", version="0.2.0")
 
@@ -22,59 +26,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+LOGGER = logging.getLogger(__name__)
+
+RECORD_OUTPUT_DIR = Path(os.getenv("RECORD_OUTPUT_DIR", "recordings"))
+RECORD_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+RECORD_FILE_PREFIX = os.getenv("RECORD_FILE_PREFIX", "capture")
+
+
+class RecordStartRequest(BaseModel):
+    path: Optional[str] = None
+    fps: Optional[float] = None
+    codec: Optional[str] = "mp4v"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _build_camera() -> CameraStream:
     """
-    USB-only OpenCV (V4L2) camera builder.
-    You can tweak device index, resolution, fps, and controls via environment vars:
-      CAM_DEVICE_INDEX (int) default 0
-      CAM_WIDTH (int)        default 1536
-      CAM_HEIGHT (int)       default 864
-      CAM_FPS (float)        default 20.0
-      CAM_PREFER_MJPEG (0/1) default 1
-      CAM_AUTOFOCUS (0/1/None) default None (leave driver default)
-      CAM_EXPOSURE (float/None) default None (leave driver default)
+    Build the PiCamera2-backed stream. Camera configuration is controlled via
+    environment variables documented in ``backend/app/camera.py``.
     """
-    device_index = int(os.getenv("CAM_DEVICE_INDEX", "0"))
-    width = int(os.getenv("CAM_WIDTH", "1280"))
-    height = int(os.getenv("CAM_HEIGHT", "1024"))
-    fps = float(os.getenv("CAM_FPS", "15.0"))
-    prefer_mjpeg = os.getenv("CAM_PREFER_MJPEG", "1") not in ("0", "false", "False")
-    af_env = os.getenv("CAM_AUTOFOCUS", "").strip()
-    exposure_env = os.getenv("CAM_EXPOSURE", "").strip()
-
-    autofocus = None
-    if af_env != "":
-        autofocus = 1 if af_env in ("1", "true", "True") else 0
-
-    exposure = None
-    if exposure_env != "":
-        try:
-            exposure = float(exposure_env)
-        except ValueError:
-            exposure = None
-
-    cam = CameraStream(
-        device_index=device_index,
-        width=width,
-        height=height,
-        target_fps=fps,
-        prefer_mjpeg=prefer_mjpeg,
-        reopen_on_fail=True,
-        autofocus=autofocus,
-        exposure=exposure,
-    )
-    return cam
+    return CameraStream()
 
 camera = _build_camera()
-# Rotate incoming frames so the stream is upright before other hooks run
-camera.register_hook(rotate_frame(90))
-# Sharpen edges slightly to improve perceived crispness without changing framing
-camera.register_hook(sharpen_frame)
+
+# Sharpen edges slightly to improve perceived crispness without changing framing.
+if _env_flag("STREAM_ENABLE_SHARPEN", False):
+    camera.register_hook(sharpen_frame)
 camera.register_hook(annotate_frame)
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    camera.start()
+    try:
+        camera.start()
+    except Exception:
+        LOGGER.exception("Camera failed to start during FastAPI startup.")
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
@@ -86,7 +77,10 @@ async def health() -> dict[str, bool]:
 
 @app.post("/camera/start")
 async def camera_start() -> dict[str, bool]:
-    camera.start()
+    try:
+        camera.start()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
     return {"ok": True}
 
 @app.post("/camera/stop")
@@ -96,7 +90,40 @@ async def camera_stop() -> dict[str, bool]:
 
 @app.get("/camera/status")
 async def camera_status() -> dict[str, object]:
-    return {"running": camera.is_running(), "backend": camera.backend_name()}
+    return {
+        "running": camera.is_running(),
+        "backend": camera.backend_name(),
+        "recording": camera.is_recording(),
+        "recording_path": camera.recording_path(),
+    }
+
+@app.post("/record/start")
+async def record_start(
+    payload: RecordStartRequest | None = Body(default=None),
+) -> dict[str, object]:
+    data = payload or RecordStartRequest()
+    path = data.path
+    fps = data.fps
+    codec = data.codec or "mp4v"
+
+    if not path:
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        filename = f"{RECORD_FILE_PREFIX}_{timestamp}.mp4"
+        path = str((RECORD_OUTPUT_DIR / filename).resolve())
+
+    try:
+        actual_path = camera.start_recording(output_path=path, fps=fps, codec=codec)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"ok": True, "path": actual_path, "recording": True}
+
+@app.post("/record/stop")
+async def record_stop() -> dict[str, object]:
+    path = camera.stop_recording()
+    if path is None:
+        raise HTTPException(status_code=409, detail="Recording not active.")
+    return {"ok": True, "path": path, "recording": False}
 
 @app.get("/frame")
 async def single_frame() -> Response:

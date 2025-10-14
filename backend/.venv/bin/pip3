@@ -1,4 +1,4 @@
-#!/home/rex/CDE3301/code/backend/.venv/bin/python3
+#!/home/rpi5/StreamGen3301/backend/.venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

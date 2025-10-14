@@ -1,4 +1,4 @@
-# Pi Camera Streaming Pipeline (No Docker)
+# Pi Camera Streaming Pipeline
 
 This repo contains a lightweight pipeline for streaming Raspberry Pi camera frames to a browser. It is split into a FastAPI backend and a static frontend:
 
@@ -6,6 +6,32 @@ This repo contains a lightweight pipeline for streaming Raspberry Pi camera fram
 backend/   # FastAPI application that exposes MJPEG and single-frame endpoints
 frontend/  # Static site that talks to the backend, displays the stream, and controls the camera
 ```
+
+## Docker Compose
+
+You can run the backend and frontend with Docker (compose v2). The stack mounts a persistent recordings volume and exposes the services on the host.
+
+```bash
+# Optional: enable the camera when running on a Raspberry Pi host.
+export CAMERA_ENABLED=1
+
+docker compose up --build
+```
+
+Access the frontend at <http://localhost:3000>. The backend is forwarded to <http://localhost:8000>.
+
+> **Note**  
+> The backend image is based on `dtcooper/raspberrypi-os:bookworm` so it expects an ARMv7/ARM64 host (e.g., Raspberry Pi). Buildx or emulation is required to run it on other architectures.
+
+### Pi camera hardware inside the container
+
+The backend image disables the camera by default (`CAMERA_ENABLED=0`) so it can run on development machines without hardware. When deploying on a Raspberry Pi:
+
+1. Set `CAMERA_ENABLED=1` in the environment (as shown above).
+2. Uncomment the `devices`, `security_opt`, and `privileged` lines under the `backend` service in `docker-compose.yml`, then adjust for your camera nodes (e.g. `/dev/video0`, `/dev/video1`).
+3. Ensure the host has the PiCamera2 stack installed so the container can access the bindings.
+
+Recordings are stored in a named Docker volume (`backend-recordings`). You can point `RECORD_OUTPUT_DIR` to a bind mount path instead if you need direct host access.
 
 ## Backend
 
@@ -18,7 +44,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-On Raspberry Pi devices with PiCamera2 installed, the service automatically uses it. Streams default to **1536×864 @ 20 FPS** to match the HQ camera profile. If PiCamera2 is missing (e.g. on a development laptop), it falls back to OpenCV. To force the OpenCV backend, set `PI_CAMERA_BACKEND=opencv`.
+On Raspberry Pi devices with PiCamera2 installed, the service automatically uses it. Streams default to **1536×864 @ 20 FPS** to match the HQ camera profile. If the module or hardware is unavailable, start the API with `CAMERA_ENABLED=0` so that non-camera features remain accessible.
 
 ### Run
 
@@ -31,7 +57,7 @@ Key endpoints:
 | Endpoint              | Method | Description                                |
 |-----------------------|--------|--------------------------------------------|
 | `/health`             | GET    | Basic readiness check                      |
-| `/camera/status`      | GET    | Indicates backend (`picamera2`/`opencv`)   |
+| `/camera/status`      | GET    | Indicates backend name (`picamera2` etc.)  |
 | `/camera/start`       | POST   | Ensures capture thread is running          |
 | `/camera/stop`        | POST   | Stops capture                              |
 | `/frame`              | GET    | Returns a single JPEG frame                |
